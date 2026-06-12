@@ -26,7 +26,7 @@
 ### 安装脚本
 你可以选择以下任意一种方式安装：
 - **方式 A（推荐，支持跟随主分支自动更新）**：
-  点击安装链接：[点击直接安装 (Raw Link)](https://raw.githubusercontent.com/你的用户名/huawei-talent-helper/main/src/huawei-talent-helper.user.js) *(请将链接替换为你自己的实际地址)*
+  点击安装链接：[点击直接安装 (Raw Link)](https://raw.githubusercontent.com/Jhaplin/huawei-talent-helper/main/src/huawei-talent-helper.user.js) *(请将链接替换为你自己的实际地址)*
 - **方式 B**：复制本仓库 `src/huawei-talent-helper.user.js` 中的完整代码，粘贴至 Tampermonkey 的“添加新脚本”编辑器中保存即可。
 
 ## 架构设计简述
