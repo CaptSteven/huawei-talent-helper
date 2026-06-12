@@ -1,5 +1,3 @@
-# huawei-talent-helper
-华为人才在线网课助手，支持自动连播、倍速调节、跳过"本章课件" 和 "随堂测验"。
 # 华为人才在线课程助手 (Huawei Talent Helper)
 
 [![License](https://img.shields.io/github/license/你的用户名/huawei-talent-helper)](LICENSE)
