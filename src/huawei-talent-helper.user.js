@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         华为人才在线课程助手 (Huawei Talent Helper) - v1.3.1
+// @name         华为人才在线课程助手 (Huawei Talent Helper) - v1.3.3
 // @namespace    http://tampermonkey.net/
-// @version      1.3.1
+// @version      1.3.3
 // @description  【AI做题增强】支持自动连播、倍速、防挂机，并可调用 DeepSeek/Gemini/Qwen 官方 API 自动进入测验、逐题作答、检查未答、交卷并进入下一环节。
 // @author       Antigravity
 // @match        *://e.huawei.com/cn/talent/*
@@ -79,6 +79,7 @@
     let lastAiQuestionSignature = '';
     let lastAiSolveTime = 0;
     let quizSubmittedAt = 0;
+    let lastTrySubmitTime = 0; // 记录最近一次点击「下一题/提交」的时间，用于防止转场期 finalizeQuiz 误触发跳题
 
     function loadAiConfig() {
         let saved = null;
@@ -177,7 +178,7 @@
             const applied = applyAiAnswers(questions, answer);
             if (applied > 0) {
                 reportAiStatus(`已回填 ${applied} 道题的答案`, 'success');
-                if (AI_CONFIG.autoSubmit) setTimeout(trySubmitAnswer, 800);
+                if (AI_CONFIG.autoSubmit) setTimeout(trySubmitAnswer, 1500);
             } else {
                 reportAiStatus('模型返回了结果，但没有匹配到可回填答案', 'warn');
             }
@@ -521,6 +522,7 @@
     }
 
     function trySubmitAnswer() {
+        lastTrySubmitTime = Date.now();
         const sxzNextBtn = Array.from(document.querySelectorAll('.test-content .subject-btn'))
             .filter(isVisibleElement)
             .find(el => /下一题|下一步|提交|完成/.test(normalizeText(el.innerText)));
@@ -664,6 +666,12 @@
         }
 
         if (document.querySelector('.test-content')) {
+            // 安全门：「下一题/提交」点击后 4s 内禁止调用 finalizeQuiz，
+            // 避免新题目 DOM 未渲染完成时 findQuizNextButton 误点下一题造成跳题。
+            if (Date.now() - lastTrySubmitTime < 4000) {
+                reportAiStatus('等待题目加载...', 'info');
+                return;
+            }
             finalizeQuiz();
             return;
         }
@@ -749,6 +757,7 @@
                     const newProgress = `${incoming.cur} / ${incoming.dur} (${incoming.pct}%)`;
                     let newStatus = incoming.isEscape ? "⚠️ 检测到非视频盲区，准备逃逸..." : "正在播放";
                     if (incoming.ended && !incoming.isEscape) newStatus = "本节已完成";
+                    else if (incoming.playBlocked) newStatus = "⚠️ 自动播放被拦截，请点击视频";
                     else if (incoming.paused && !incoming.isEscape) newStatus = "已暂停";
 
                     if (globalState.progress !== newProgress || globalState.status !== newStatus || globalState.videoEnded !== incoming.ended) {
@@ -779,6 +788,26 @@
             }
         }, 1000);
 
+        // 给 iframe 注入 autoplay 权限，解决跨域 iframe 自动播放被浏览器拦截的问题
+        (function patchIframeAutoplay() {
+            const addAutoplay = (el) => {
+                if (el.nodeName !== 'IFRAME') return;
+                const cur = el.getAttribute('allow') || '';
+                if (!cur.includes('autoplay')) {
+                    el.setAttribute('allow', cur ? cur + '; autoplay' : 'autoplay');
+                }
+            };
+            document.querySelectorAll('iframe').forEach(addAutoplay);
+            new MutationObserver(mutations => {
+                for (const m of mutations) {
+                    m.addedNodes.forEach(node => {
+                        if (node.nodeName === 'IFRAME') { addAutoplay(node); return; }
+                        if (node.querySelectorAll) node.querySelectorAll('iframe').forEach(addAutoplay);
+                    });
+                }
+            }).observe(document.documentElement, { childList: true, subtree: true });
+        })();
+
         function initGlobalPanel() {
             panelElement = document.createElement('div');
             panelElement.id = 'hw-global-panel';
@@ -793,7 +822,7 @@
 
             panelElement.innerHTML = `
                 <div id="hw-drag-head" style="font-weight: bold; color: #ee0000; border-bottom: 1px solid #ebeef5; margin-bottom: 8px; padding-bottom: 6px; cursor: move; display: flex; justify-content: space-between; align-items: center;">
-                    <span id="hw-panel-title">华为助手 v1.3.1</span>
+                    <span id="hw-panel-title">华为助手 v1.3.3</span>
                     <span id="btn-fold" style="cursor: pointer; font-family: monospace; font-size: 14px; font-weight: bold; color: #909399; padding: 0 6px; background: #f4f4f5; border-radius: 3px;">[-]</span>
                 </div>
                 <div id="hw-panel-body">
@@ -877,7 +906,7 @@
                     mini.style.display = 'none';
                     this.innerText = '[-]';
                     panelElement.style.width = '320px';
-                    panelElement.querySelector('#hw-panel-title').innerText = '华为助手 v1.3.1';
+                    panelElement.querySelector('#hw-panel-title').innerText = '华为助手 v1.3.3';
                 }
                 updatePanelUI();
             });
@@ -1027,7 +1056,11 @@
             if (video) {
                 if (video.playbackRate !== CONFIG.playbackSpeed) video.playbackRate = CONFIG.playbackSpeed;
                 if (video.paused && !video.ended && !video.seeking && video.readyState >= 2) {
-                    video.play().catch(() => {});
+                    video.play().catch(e => {
+                        if (e && e.name === 'NotAllowedError') {
+                            packet.playBlocked = true;
+                        }
+                    });
                 }
 
                 packet.hasVideo = true;
