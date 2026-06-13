@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         华为人才在线课程助手 (Huawei Talent Helper) - v1.3.3
+// @name         华为人才在线课程助手 (Huawei Talent Helper) - v1.3.4
 // @namespace    http://tampermonkey.net/
-// @version      1.3.3
+// @version      1.3.4
 // @description  【AI做题增强】支持自动连播、倍速、防挂机，并可调用 DeepSeek/Gemini/Qwen 官方 API 自动进入测验、逐题作答、检查未答、交卷并进入下一环节。
 // @author       Antigravity
 // @match        *://e.huawei.com/cn/talent/*
@@ -615,7 +615,9 @@
     function shouldHoldForQuiz() {
         if (!AI_CONFIG.enabled || !AI_CONFIG.autoSolve) return false;
         if (quizSubmittedAt && Date.now() - quizSubmittedAt < 60000) return false; // 已交卷，放行让其进入下一环节
-        return !!document.querySelector('.test-content, .start-test');
+        if (document.querySelector('.test-content, .start-test')) return true;
+        // 答题卡阶段：.test-content 可能已消失，但「交卷」按钮仍可见时同样 hold，防止提前逃逸
+        return !!findQuizSubmitButton();
     }
 
     // 完成答题后的收尾：检查未答 → 交卷 → 进入下一环节。
@@ -666,13 +668,24 @@
         }
 
         if (document.querySelector('.test-content')) {
-            // 安全门：「下一题/提交」点击后 4s 内禁止调用 finalizeQuiz，
+            // 安全门：有活跃题目时「下一题/提交」点击后 4s 内禁止调用 finalizeQuiz，
             // 避免新题目 DOM 未渲染完成时 findQuizNextButton 误点下一题造成跳题。
-            if (Date.now() - lastTrySubmitTime < 4000) {
+            // 无活跃题目（答题卡阶段）跳过延迟，直接进入收尾。
+            const hasActiveQuestion = !!document.querySelector('.test-content .option-list-item');
+            if (hasActiveQuestion && Date.now() - lastTrySubmitTime < 4000) {
                 reportAiStatus('等待题目加载...', 'info');
                 return;
             }
             finalizeQuiz();
+            return;
+        }
+
+        // 答题卡阶段：.test-content 已不存在，但「交卷」按钮可见时直接交卷
+        const pendingSubmit = findQuizSubmitButton();
+        if (pendingSubmit) {
+            pendingSubmit.click();
+            quizSubmittedAt = Date.now();
+            reportAiStatus('全部作答完成，已自动交卷', 'success');
             return;
         }
 
@@ -822,7 +835,7 @@
 
             panelElement.innerHTML = `
                 <div id="hw-drag-head" style="font-weight: bold; color: #ee0000; border-bottom: 1px solid #ebeef5; margin-bottom: 8px; padding-bottom: 6px; cursor: move; display: flex; justify-content: space-between; align-items: center;">
-                    <span id="hw-panel-title">华为助手 v1.3.3</span>
+                    <span id="hw-panel-title">华为助手 v1.3.4</span>
                     <span id="btn-fold" style="cursor: pointer; font-family: monospace; font-size: 14px; font-weight: bold; color: #909399; padding: 0 6px; background: #f4f4f5; border-radius: 3px;">[-]</span>
                 </div>
                 <div id="hw-panel-body">
@@ -906,7 +919,7 @@
                     mini.style.display = 'none';
                     this.innerText = '[-]';
                     panelElement.style.width = '320px';
-                    panelElement.querySelector('#hw-panel-title').innerText = '华为助手 v1.3.3';
+                    panelElement.querySelector('#hw-panel-title').innerText = '华为助手 v1.3.4';
                 }
                 updatePanelUI();
             });
