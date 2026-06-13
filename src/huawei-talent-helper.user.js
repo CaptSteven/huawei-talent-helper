@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         华为人才在线课程助手 (Huawei Talent Helper) - v1.3
+// @name         华为人才在线课程助手 (Huawei Talent Helper) - v1.3.1
 // @namespace    http://tampermonkey.net/
-// @version      1.3
+// @version      1.3.1
 // @description  【AI做题增强】支持自动连播、倍速、防挂机，并可调用 DeepSeek/Gemini/Qwen 官方 API 自动进入测验、逐题作答、检查未答、交卷并进入下一环节。
 // @author       Antigravity
 // @match        *://e.huawei.com/cn/talent/*
@@ -480,10 +480,15 @@
             const question = questions.find(q => q.index === Number(answer.questionIndex));
             if (!question) return;
             const indexes = Array.isArray(answer.optionIndexes) ? answer.optionIndexes.map(Number) : [];
-            if (indexes.length === 0) return;
+            // 过滤越界 / 非法索引，避免模型给出页面上根本不存在的选项号
+            const validIndexes = indexes.filter(i => Number.isInteger(i) && i >= 0 && i < question.options.length);
+            if (validIndexes.length === 0) {
+                console.log(`[华为助手 AI] 第 ${question.index} 题：模型返回索引 ${JSON.stringify(indexes)} 超出 0~${question.options.length - 1}，跳过回填且不计入已答（避免空答被推进）`);
+                return;
+            }
 
             question.options.forEach((option, idx) => {
-                const shouldSelect = indexes.includes(idx);
+                const shouldSelect = validIndexes.includes(idx);
                 const input = option.input;
                 if (!input || input.disabled) return;
 
@@ -493,7 +498,16 @@
                     clickAnswerInput(input, option.clickTarget);
                 }
             });
-            applied++;
+
+            // 关键修复：以「真实勾选状态」判定是否已作答，而不是「遍历过这道题」。
+            // 旧逻辑无条件 applied++，当点击没生效（clickTarget 不对、控件被框架接管等）时，
+            // 仍会触发自动提交把空白题翻过去 —— 这正是「没选答案就跳到下一题」的根因。
+            const reallySelected = validIndexes.filter(i => question.options[i] && question.options[i].input && question.options[i].input.checked).length;
+            if (reallySelected > 0) {
+                applied++;
+            } else {
+                console.log(`[华为助手 AI] 第 ${question.index} 题：点选后没有任何选项处于选中态，判定回填失败，不推进（留待下一轮重试或人工处理）`);
+            }
         });
         return applied;
     }
@@ -779,7 +793,7 @@
 
             panelElement.innerHTML = `
                 <div id="hw-drag-head" style="font-weight: bold; color: #ee0000; border-bottom: 1px solid #ebeef5; margin-bottom: 8px; padding-bottom: 6px; cursor: move; display: flex; justify-content: space-between; align-items: center;">
-                    <span id="hw-panel-title">华为助手 v1.3</span>
+                    <span id="hw-panel-title">华为助手 v1.3.1</span>
                     <span id="btn-fold" style="cursor: pointer; font-family: monospace; font-size: 14px; font-weight: bold; color: #909399; padding: 0 6px; background: #f4f4f5; border-radius: 3px;">[-]</span>
                 </div>
                 <div id="hw-panel-body">
@@ -863,7 +877,7 @@
                     mini.style.display = 'none';
                     this.innerText = '[-]';
                     panelElement.style.width = '320px';
-                    panelElement.querySelector('#hw-panel-title').innerText = '华为助手 v1.3';
+                    panelElement.querySelector('#hw-panel-title').innerText = '华为助手 v1.3.1';
                 }
                 updatePanelUI();
             });
