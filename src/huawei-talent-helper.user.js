@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         华为人才在线课程助手 (Huawei Talent Helper) - v1.2
+// @name         华为人才在线课程助手 (Huawei Talent Helper) - v1.3
 // @namespace    http://tampermonkey.net/
-// @version      1.2
-// @description  【AI做题增强】支持自动连播、倍速、防挂机，并可调用 DeepSeek/Gemini/Qwen 官方 API 辅助识别随堂题目。
+// @version      1.3
+// @description  【AI做题增强】支持自动连播、倍速、防挂机，并可调用 DeepSeek/Gemini/Qwen 官方 API 自动进入测验、逐题作答、检查未答、交卷并进入下一环节。
 // @author       Antigravity
 // @match        *://e.huawei.com/cn/talent/*
 // @match        *://*.huawei.com/*
@@ -78,6 +78,7 @@
     let aiSolveLock = false;
     let lastAiQuestionSignature = '';
     let lastAiSolveTime = 0;
+    let quizSubmittedAt = 0;
 
     function loadAiConfig() {
         let saved = null;
@@ -536,6 +537,128 @@
         }
     }
 
+    // ===== AI 自动答题全流程驱动 =====
+    // 在「启用 + 自动识别 + 自动提交」全开时，串联：进入测验 → 逐题作答 → 检查未答 → 交卷 → 进入下一环节。
+
+    // 找到「开始测验 / 继续答题」入口按钮。
+    function findQuizStartButton() {
+        const direct = document.querySelector('.start-test');
+        if (direct && isVisibleElement(direct)) return direct;
+        return findQuizButtonByText(['开始测验', '开始答题', '开始考试', '继续测验', '继续答题', '进入测验', '立即测验', '马上测验']);
+    }
+
+    // 找到最终「交卷」按钮（区别于逐题的「下一题/提交」）。
+    function findQuizSubmitButton() {
+        const sxz = Array.from(document.querySelectorAll('.test-content .submit-btn, .submit-btn'))
+            .filter(isVisibleElement)
+            .find(el => /交卷|提交试卷|提交答卷|完成测验/.test(normalizeText(el.innerText)));
+        if (sxz) return sxz;
+        return findQuizButtonByText(['交卷', '提交试卷', '提交答卷', '完成测验']);
+    }
+
+    // 找到逐题推进按钮（下一题 / 提交本题）。
+    function findQuizNextButton() {
+        return Array.from(document.querySelectorAll('.test-content .subject-btn'))
+            .filter(isVisibleElement)
+            .find(el => /下一题|下一步|提交|完成|确定/.test(normalizeText(el.innerText))) || null;
+    }
+
+    // 进入下一个学习环节（答题结束后的结果页）。
+    function tryProceedToNextStage() {
+        const btn = findQuizButtonByText(['下一节', '下一个', '下一章', '下一环节', '继续学习', '下一步', '继续']);
+        if (btn) {
+            btn.click();
+            reportAiStatus('正在进入下一环节', 'info');
+            return true;
+        }
+        return false;
+    }
+
+    // 按文本关键词在按钮类元素中查找（限制文本长度，避免误命中大容器）。
+    function findQuizButtonByText(keywords) {
+        const candidates = Array.from(document.querySelectorAll(
+            'button, .el-button, [role="button"], input[type="button"], input[type="submit"], a, .subject-btn, .submit-btn, .start-test, [class*="btn" i]'
+        )).filter(isVisibleElement);
+        return candidates.find(el => {
+            const text = normalizeText(el.innerText || el.value || el.getAttribute('aria-label') || '');
+            if (!text || text.length > 12) return false;
+            return keywords.some(kw => text.includes(kw));
+        }) || null;
+    }
+
+    // 答题卡中明确标记为「未作答」的题目（仅在能正向识别未答标记时返回，避免死循环）。
+    function findUnansweredCardItem() {
+        const items = Array.from(document.querySelectorAll(
+            '[class*="answer-card" i] [class*="item" i], [class*="answer-sheet" i] [class*="item" i], [class*="card-item" i], [class*="question-no" i], [class*="ques-no" i]'
+        )).filter(isVisibleElement);
+        if (items.length === 0) return null;
+        return items.find(it => /un-?answer|no-?answer|undone|not-?done|wait|empty|gray|grey/i.test(it.className || '')) || null;
+    }
+
+    // 当前是否正处于「正在答题」的测验流程中（用于抑制盲区逃逸，避免半途跳走）。
+    function shouldHoldForQuiz() {
+        if (!AI_CONFIG.enabled || !AI_CONFIG.autoSolve) return false;
+        if (quizSubmittedAt && Date.now() - quizSubmittedAt < 60000) return false; // 已交卷，放行让其进入下一环节
+        return !!document.querySelector('.test-content, .start-test');
+    }
+
+    // 完成答题后的收尾：检查未答 → 交卷 → 进入下一环节。
+    function finalizeQuiz() {
+        const unanswered = findUnansweredCardItem();
+        if (unanswered) {
+            unanswered.click();
+            reportAiStatus('发现未作答题目，正在返回作答', 'warn');
+            return;
+        }
+
+        const submitBtn = findQuizSubmitButton();
+        if (submitBtn) {
+            submitBtn.click();
+            quizSubmittedAt = Date.now();
+            reportAiStatus('全部作答完成，已自动交卷', 'success');
+            return; // 交卷确认弹窗由 handlePopups 自动点「确定」
+        }
+
+        const nextBtn = findQuizNextButton();
+        if (nextBtn) {
+            nextBtn.click();
+            return;
+        }
+
+        if (quizSubmittedAt && tryProceedToNextStage()) quizSubmittedAt = 0;
+    }
+
+    // 自动答题主循环（每 5 秒）：逐题作答；空闲时进入测验 / 收尾交卷 / 进入下一环节。
+    async function runAutoAiCycle() {
+        AI_CONFIG = loadAiConfig();
+        if (!AI_CONFIG.enabled || !AI_CONFIG.autoSolve) return;
+        if (aiSolveLock) return;
+
+        const questions = collectQuestionGroups();
+        if (questions.length > 0) {
+            await solveQuestionsWithAi('auto'); // 回填答案，开启自动提交时顺带推进到下一题
+            return;
+        }
+
+        if (!AI_CONFIG.autoSubmit) return; // 仅回填、不导航
+
+        const startBtn = findQuizStartButton();
+        if (startBtn) {
+            startBtn.click();
+            reportAiStatus('已自动进入测验', 'info');
+            return;
+        }
+
+        if (document.querySelector('.test-content')) {
+            finalizeQuiz();
+            return;
+        }
+
+        if (quizSubmittedAt && Date.now() - quizSubmittedAt < 120000) {
+            if (tryProceedToNextStage()) quizSubmittedAt = 0;
+        }
+    }
+
     function isVisibleElement(el) {
         if (!el) return false;
         const rect = el.getBoundingClientRect();
@@ -576,11 +699,7 @@
         if (IS_TOP && msg.type === 'HW_AI_STATUS') updateAiStatus(msg.data);
     });
 
-    setInterval(() => {
-        AI_CONFIG = loadAiConfig();
-        if (!AI_CONFIG.enabled || !AI_CONFIG.autoSolve) return;
-        solveQuestionsWithAi('auto');
-    }, 5000);
+    setInterval(() => { runAutoAiCycle(); }, 5000);
 
     // ==========================================
     // 架构 A：顶层窗口（中央大脑状态融合）
@@ -660,7 +779,7 @@
 
             panelElement.innerHTML = `
                 <div id="hw-drag-head" style="font-weight: bold; color: #ee0000; border-bottom: 1px solid #ebeef5; margin-bottom: 8px; padding-bottom: 6px; cursor: move; display: flex; justify-content: space-between; align-items: center;">
-                    <span id="hw-panel-title">华为助手 v1.1</span>
+                    <span id="hw-panel-title">华为助手 v1.3</span>
                     <span id="btn-fold" style="cursor: pointer; font-family: monospace; font-size: 14px; font-weight: bold; color: #909399; padding: 0 6px; background: #f4f4f5; border-radius: 3px;">[-]</span>
                 </div>
                 <div id="hw-panel-body">
@@ -744,7 +863,7 @@
                     mini.style.display = 'none';
                     this.innerText = '[-]';
                     panelElement.style.width = '320px';
-                    panelElement.querySelector('#hw-panel-title').innerText = '华为助手 v1.1';
+                    panelElement.querySelector('#hw-panel-title').innerText = '华为助手 v1.3';
                 }
                 updatePanelUI();
             });
@@ -914,7 +1033,7 @@
                 // 如果当前页面激活了非视频节点且页面中找不到 video 标签，强行伪装已结束状态触发弹飞
                 if (!video) {
                     const isTargetBlack = BLACKLIST_KEYWORDS.some(kw => nodeTitle.includes(kw));
-                    if (isTargetBlack) {
+                    if (isTargetBlack && !shouldHoldForQuiz()) {
                         packet.hasVideo = true;
                         packet.ended = true;
                         packet.isEscape = true;
