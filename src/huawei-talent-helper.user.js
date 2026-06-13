@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         华为人才在线课程助手 (Huawei Talent Helper) - v1.3.7
+// @name         华为人才在线课程助手 (Huawei Talent Helper) - v1.3.8
 // @namespace    http://tampermonkey.net/
-// @version      1.3.7
+// @version      1.3.8
 // @description  【AI做题增强】支持自动连播、倍速、防挂机，并可调用 DeepSeek/Gemini/Qwen 官方 API 自动进入测验、逐题作答、检查未答、交卷并进入下一环节。
 // @author       Antigravity
 // @match        *://e.huawei.com/cn/talent/*
@@ -757,13 +757,15 @@
         let isCollapsed = false;
         let countdownValue = 0;
         let countdownTimer = null;
-        let jumpLock = false; 
+        let jumpLock = false;
+        let quizHoldTimer = null; // 课程 iframe 做题时抑制逃逸倒计时
 
         let globalState = {
             title: "正在定位课程...",
             status: "等待同步...",
             progress: "00:00 / 00:00 (0%)",
-            videoEnded: false
+            videoEnded: false,
+            quizHoldActive: false  // 任意子 iframe 正在做题时为 true
         };
 
         window.addEventListener('message', (event) => {
@@ -773,6 +775,21 @@
             if (msg.type === 'HW_FRAME_REPORT') {
                 const incoming = msg.data;
                 let isAltered = false;
+
+                // 课程 iframe 正在做题：刷新 hold 并取消已启动的逃逸倒计时
+                if (incoming.holdForQuiz) {
+                    globalState.quizHoldActive = true;
+                    clearTimeout(quizHoldTimer);
+                    quizHoldTimer = setTimeout(() => { globalState.quizHoldActive = false; }, 3000);
+                    if (countdownTimer && countdownValue > 0) {
+                        clearInterval(countdownTimer);
+                        countdownTimer = null;
+                        countdownValue = 0;
+                        jumpLock = false;
+                        globalState.videoEnded = false;
+                        updatePanelUI();
+                    }
+                }
 
                 if (incoming.hasCatalog && incoming.title && globalState.title !== incoming.title) {
                     globalState.title = incoming.title;
@@ -796,7 +813,8 @@
 
                 if (isAltered) updatePanelUI();
 
-                if (globalState.videoEnded && CONFIG.autoNext && !jumpLock) {
+                // quizHoldActive 时不启动逃逸倒计时，等 hold 过期后自然触发
+                if (globalState.videoEnded && CONFIG.autoNext && !jumpLock && !globalState.quizHoldActive) {
                     jumpLock = true;
                     startCentralCountdown();
                 }
@@ -848,7 +866,7 @@
 
             panelElement.innerHTML = `
                 <div id="hw-drag-head" style="font-weight: bold; color: #ee0000; border-bottom: 1px solid #ebeef5; margin-bottom: 8px; padding-bottom: 6px; cursor: move; display: flex; justify-content: space-between; align-items: center;">
-                    <span id="hw-panel-title">华为助手 v1.3.7</span>
+                    <span id="hw-panel-title">华为助手 v1.3.8</span>
                     <span id="btn-fold" style="cursor: pointer; font-family: monospace; font-size: 14px; font-weight: bold; color: #909399; padding: 0 6px; background: #f4f4f5; border-radius: 3px;">[-]</span>
                 </div>
                 <div id="hw-panel-body">
@@ -932,7 +950,7 @@
                     mini.style.display = 'none';
                     this.innerText = '[-]';
                     panelElement.style.width = '320px';
-                    panelElement.querySelector('#hw-panel-title').innerText = '华为助手 v1.3.7';
+                    panelElement.querySelector('#hw-panel-title').innerText = '华为助手 v1.3.8';
                 }
                 updatePanelUI();
             });
@@ -1074,6 +1092,12 @@
         setInterval(function pureIframeScanner() {
             const video = document.querySelector('video');
             const activeNode = document.querySelector('[class*="current" i] .text, [class*="active" i] .text, .is-current .text, .is-active .text, .is-current, .is-active');
+
+            // 如果此 iframe 正在做题（有 .test-content），主动告知顶层抑制逃逸倒计时
+            // 解决：目录 iframe 发出 isEscape 时，顶层不知道课程 iframe 正在做题
+            if (shouldHoldForQuiz()) {
+                window.top.postMessage({ type: 'HW_FRAME_REPORT', data: { holdForQuiz: true } }, '*');
+            }
 
             if (!video && !activeNode) return;
 
