@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         华为人才在线课程助手 (Huawei Talent Helper) - v1.3.9
+// @name         华为人才在线课程助手 (Huawei Talent Helper) - v1.3.10
 // @namespace    http://tampermonkey.net/
-// @version      1.3.9
+// @version      1.3.10
 // @description  【AI做题增强】支持自动连播、倍速、防挂机，并可调用 DeepSeek/Gemini/Qwen 官方 API 自动进入测验、逐题作答、检查未答、交卷并进入下一环节。
 // @author       Antigravity
 // @match        *://e.huawei.com/cn/talent/*
@@ -922,7 +922,7 @@
 
             panelElement.innerHTML = `
                 <div id="hw-drag-head" style="font-weight: bold; color: #ee0000; border-bottom: 1px solid #ebeef5; margin-bottom: 8px; padding-bottom: 6px; cursor: move; display: flex; justify-content: space-between; align-items: center;">
-                    <span id="hw-panel-title">华为助手 v1.3.9</span>
+                    <span id="hw-panel-title">华为助手 v1.3.10</span>
                     <span id="btn-fold" style="cursor: pointer; font-family: monospace; font-size: 14px; font-weight: bold; color: #909399; padding: 0 6px; background: #f4f4f5; border-radius: 3px;">[-]</span>
                 </div>
                 <div id="hw-panel-body">
@@ -1012,7 +1012,7 @@
                     mini.style.display = 'none';
                     this.innerText = '[-]';
                     panelElement.style.width = '320px';
-                    panelElement.querySelector('#hw-panel-title').innerText = '华为助手 v1.3.9';
+                    panelElement.querySelector('#hw-panel-title').innerText = '华为助手 v1.3.10';
                 }
                 updatePanelUI();
             });
@@ -1136,6 +1136,8 @@
     if (!IS_TOP) {
         // 全局敏感黑名单特征词
         const BLACKLIST_KEYWORDS = ['课件', '测验', '考试', '作业', '练习', '文档', '资料'];
+        // 测验类节点：开启 AI 自动识别时不跳过、落到该节点交给 runAutoAiCycle 自动开始测验并答题
+        const QUIZ_KEYWORDS = ['测验', '考试'];
 
         // 课件翻页状态：coursewareFlipping 防重入（一次只翻一遍），coursewareFlipDone 翻到末页后置 true 放行逃逸推进。
         // lastCoursewareTitle 记录上一次处理的课件标题：目录树与 PPT 内容可能不在同一 iframe（各 frame 变量独立），
@@ -1143,6 +1145,10 @@
         let coursewareFlipping = false;
         let coursewareFlipDone = false;
         let lastCoursewareTitle = '';
+        // 测验节点「按住逃逸」起始时刻：开启 AI 自动识别后落到测验节点即按住，交给 AI 流程；
+        // 带兜底超时，防止测验 UI 始终加载不出来 / AI 一直失败时永久卡在该节点。
+        let lastQuizTitle = '';
+        let quizHoldStartedAt = 0;
 
         window.addEventListener('message', (event) => {
             const msg = event.data;
@@ -1220,19 +1226,29 @@
                 // 如果当前页面激活了非视频节点且页面中找不到 video 标签，强行伪装已结束状态触发弹飞
                 if (!video) {
                     const isTargetBlack = BLACKLIST_KEYWORDS.some(kw => nodeTitle.includes(kw));
+                    const aiAuto = !!(AI_CONFIG && AI_CONFIG.enabled && AI_CONFIG.autoSolve);
                     // 课件分流：开启「自动刷课件」且当前节点是课件/阅读类（命中 COURSEWARE_KEYWORDS），
                     // 不直接逃逸，先把 PPT 逐页翻到末页（runCoursewareFlip），翻完才允许伪装 ended 推进。
-                    // 注意：测验/考试/作业/练习不在 COURSEWARE_KEYWORDS，仍走下方原有逃逸逻辑。
                     const isCourseware = CONFIG.autoCourseware && COURSEWARE_KEYWORDS.some(kw => nodeTitle.includes(kw));
+                    // 测验分流：开启 AI 自动识别时，测验/考试节点按住逃逸，交给 runAutoAiCycle 自动做题（覆盖刚落到节点、
+                    // .test-content 还没加载出来的空窗期；活跃答题期间 shouldHoldForQuiz 另有保护）。带 5 分钟兜底超时防永久卡死。
+                    const isQuizNode = aiAuto && QUIZ_KEYWORDS.some(kw => nodeTitle.includes(kw));
                     // 切到新的课件节点（标题变化）即重置完成标记：等子帧 #edmPage 重新把新 PPT 翻完再推进
                     if (isCourseware && nodeTitle !== lastCoursewareTitle) {
                         lastCoursewareTitle = nodeTitle;
                         coursewareFlipDone = false;
                     }
+                    // 落到新的测验节点（标题变化）即记录按住起始时刻
+                    if (isQuizNode && nodeTitle !== lastQuizTitle) {
+                        lastQuizTitle = nodeTitle;
+                        quizHoldStartedAt = Date.now();
+                    }
                     // 课件分流：开启自动刷课件时「按住逃逸」，直到子帧 #edmPage 把 PPT 翻到末页(发来 HW_COURSEWARE_DONE
                     // 令 coursewareFlipDone=true)，此后落到下方 isTargetBlack 分支伪装 ended 推进。关闭时课件仍走原逃逸（沿用旧「跳过」）。
                     if (isCourseware && !coursewareFlipDone) {
                         // 按住不逃逸，等待子帧翻页完成
+                    } else if (isQuizNode && (Date.now() - quizHoldStartedAt < 5 * 60 * 1000)) {
+                        // 按住不逃逸，交给 AI 做题流程（开始测验→逐题作答→交卷→点「下一节」自动推进）
                     } else if (isTargetBlack && !shouldHoldForQuiz()) {
                         packet.hasVideo = true;
                         packet.ended = true;
@@ -1280,10 +1296,12 @@
 
                 // 【防御机制一：前置特征拦截】
                 // 检查下一行文本是否命中非视频黑名单，若命中则直接跳过此节点继续向下检索
-                // 例外：开启「自动刷课件」时，课件/阅读类节点（命中 COURSEWARE_KEYWORDS）不跳过，
-                // 让导航能落到课件上由 scanner 触发逐页翻页；测验/考试/作业/练习等其余黑名单仍照常跳过。
+                // 例外一：开启「自动刷课件」时，课件/阅读类节点（命中 COURSEWARE_KEYWORDS）不跳过，落到课件由 scanner 触发翻页。
+                // 例外二：开启 AI 自动识别时，测验/考试节点（命中 QUIZ_KEYWORDS）不跳过，落到测验由 runAutoAiCycle 自动做题。
                 const isCoursewareRow = CONFIG.autoCourseware && COURSEWARE_KEYWORDS.some(kw => rowText.includes(kw));
-                const hitBlacklist = !isCoursewareRow && BLACKLIST_KEYWORDS.some(kw => rowText.includes(kw));
+                const aiAuto = !!(AI_CONFIG && AI_CONFIG.enabled && AI_CONFIG.autoSolve);
+                const isQuizRow = aiAuto && QUIZ_KEYWORDS.some(kw => rowText.includes(kw));
+                const hitBlacklist = !isCoursewareRow && !isQuizRow && BLACKLIST_KEYWORDS.some(kw => rowText.includes(kw));
                 if (hitBlacklist) {
                     console.log(`[助手 v2.1] 发现非视频盲区 [${rowText.split('\n')[0]}]，已自动执行跃迁避让。`);
                     targetIndex++;
@@ -1292,6 +1310,11 @@
                 if (isCoursewareRow) {
                     console.log(`[助手 v2.1] 命中课件节点 [${rowText.split('\n')[0]}]，自动刷课件已开启，切入并逐页翻阅。`);
                     coursewareFlipDone = false; // 进入新课件，重置翻页完成标记
+                    clickTreeRow(nextRow, false);
+                    return;
+                }
+                if (isQuizRow) {
+                    console.log(`[助手 v2.1] 命中测验节点 [${rowText.split('\n')[0]}]，AI 自动识别已开启，切入交给自动做题流程。`);
                     clickTreeRow(nextRow, false);
                     return;
                 }

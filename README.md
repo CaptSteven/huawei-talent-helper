@@ -2,7 +2,7 @@
 
 [![License](https://img.shields.io/github/license/CaptSteven/Huwei_Helper_Plug)](LICENSE)
 [![UserScript](https://img.shields.io/badge/UserScript-Tampermonkey-orange.svg)](https://www.tampermonkey.net/)
-[![Version](https://img.shields.io/badge/version-1.3.9-blue.svg)]()
+[![Version](https://img.shields.io/badge/version-1.3.10-blue.svg)]()
 
 Huwei_Helper_Plug 是一个用于华为人才在线课程页面的 Tampermonkey 脚本插件。它在课程页面注入一个悬浮控制面板，支持视频连播、倍速控制、防挂机弹窗处理，并新增 AI 做题能力。
 
