@@ -922,7 +922,7 @@
 
             panelElement.innerHTML = `
                 <div id="hw-drag-head" style="font-weight: bold; color: #ee0000; border-bottom: 1px solid #ebeef5; margin-bottom: 8px; padding-bottom: 6px; cursor: move; display: flex; justify-content: space-between; align-items: center;">
-                    <span id="hw-panel-title">华为助手 v1.3.8</span>
+                    <span id="hw-panel-title">华为助手 v1.3.9</span>
                     <span id="btn-fold" style="cursor: pointer; font-family: monospace; font-size: 14px; font-weight: bold; color: #909399; padding: 0 6px; background: #f4f4f5; border-radius: 3px;">[-]</span>
                 </div>
                 <div id="hw-panel-body">
@@ -1012,7 +1012,7 @@
                     mini.style.display = 'none';
                     this.innerText = '[-]';
                     panelElement.style.width = '320px';
-                    panelElement.querySelector('#hw-panel-title').innerText = '华为助手 v1.3.8';
+                    panelElement.querySelector('#hw-panel-title').innerText = '华为助手 v1.3.9';
                 }
                 updatePanelUI();
             });
@@ -1153,6 +1153,16 @@
                 CONFIG.playbackSpeed = msg.data.playbackSpeed;
                 if (typeof msg.data.autoCourseware === 'boolean') CONFIG.autoCourseware = msg.data.autoCourseware;
                 if (typeof msg.data.coursewarePageDelay === 'number') CONFIG.coursewarePageDelay = msg.data.coursewarePageDelay;
+                // 继续向本帧的子 iframe 下发：站点是 3 层嵌套(顶层→.sxz-iframe→#edmPage 课件帧)，
+                // 顶层 broadcastConfig 只到直接子帧，靠这一步逐级把配置（含 autoCourseware）下沉到最深的 PPT 帧。
+                document.querySelectorAll('iframe').forEach(ifr => {
+                    try { ifr.contentWindow.postMessage({ type: 'HW_CONFIG_SYNC', data: CONFIG }, '*'); } catch (e) {}
+                });
+            }
+
+            // 子帧 #edmPage 报告 PPT 已翻到末页：本帧（课件节点所在的目录帧 L2）放行逃逸推进
+            if (msg.type === 'HW_COURSEWARE_DONE') {
+                coursewareFlipDone = true;
             }
 
             if (msg.type === 'HW_COMMAND_JUMP') {
@@ -1168,6 +1178,15 @@
             // 解决：目录 iframe 发出 isEscape 时，顶层不知道课程 iframe 正在做题
             if (shouldHoldForQuiz()) {
                 window.top.postMessage({ type: 'HW_FRAME_REPORT', data: { holdForQuiz: true } }, '*');
+            }
+
+            // 【PPT 课件帧】#edmPage（最深一层）：有翻页页脚 .footer-left、无 video。优先于目录逻辑判定，
+            // 以免该帧里零散的 .active 元素被误当目录节点。这一帧负责真正逐页翻 PPT，翻完发 HW_COURSEWARE_DONE 通知父帧(L2)推进。
+            if (!video && document.querySelector('.footer-left')) {
+                // 借顶层 report→reply 机制拿到最新 CONFIG（含 autoCourseware）——该帧本不上报，否则收不到配置
+                window.top.postMessage({ type: 'HW_FRAME_REPORT', data: { isPptFrame: true } }, '*');
+                if (CONFIG.autoCourseware && !coursewareFlipDone) runCoursewareFlip();
+                return;
             }
 
             if (!video && !activeNode) return;
@@ -1205,14 +1224,15 @@
                     // 不直接逃逸，先把 PPT 逐页翻到末页（runCoursewareFlip），翻完才允许伪装 ended 推进。
                     // 注意：测验/考试/作业/练习不在 COURSEWARE_KEYWORDS，仍走下方原有逃逸逻辑。
                     const isCourseware = CONFIG.autoCourseware && COURSEWARE_KEYWORDS.some(kw => nodeTitle.includes(kw));
-                    // 切到新的课件节点（标题变化）即重置翻页状态，确保每个课件都从头翻、跨 frame 也生效
+                    // 切到新的课件节点（标题变化）即重置完成标记：等子帧 #edmPage 重新把新 PPT 翻完再推进
                     if (isCourseware && nodeTitle !== lastCoursewareTitle) {
                         lastCoursewareTitle = nodeTitle;
-                        coursewareFlipping = false;
                         coursewareFlipDone = false;
                     }
+                    // 课件分流：开启自动刷课件时「按住逃逸」，直到子帧 #edmPage 把 PPT 翻到末页(发来 HW_COURSEWARE_DONE
+                    // 令 coursewareFlipDone=true)，此后落到下方 isTargetBlack 分支伪装 ended 推进。关闭时课件仍走原逃逸（沿用旧「跳过」）。
                     if (isCourseware && !coursewareFlipDone) {
-                        runCoursewareFlip(); // 内部有防重入锁，未翻完时不允许逃逸
+                        // 按住不逃逸，等待子帧翻页完成
                     } else if (isTargetBlack && !shouldHoldForQuiz()) {
                         packet.hasVideo = true;
                         packet.ended = true;
@@ -1335,93 +1355,118 @@
             }
         }
 
-        // 【自动刷课件：启发式逐页翻页例程】
-        // 仅在 autoCourseware 开启、且当前激活节点为课件/阅读类时由 scanner 调用。
-        // 逐页点击「下一页」直至触底（按钮禁用 或 当前页>=总页），间隔 CONFIG.coursewarePageDelay，
-        // 用 setTimeout 递进不阻塞主线程；触底后置 coursewareFlipDone=true，交还 scanner 当 ended 推进。
+        // 【自动刷课件：edm PPT 逐页翻页例程】
+        // 由 scanner 在「PPT 课件帧」(#edmPage，含 .footer-left 翻页页脚的最深一层 iframe) 内调用。
+        // 真实结构（实测 talent.shixizhi.huawei.com 的 edm3client）：.footer-left 内顺序为
+        //   [img.footer-icon 首页, img.footer-icon 上一页, span 页码"43 / 43", img.footer-icon 下一页, img.footer-icon 尾页]，
+        // 翻页图标是纯 <img>（无文字/aria），到边界时该图标加 id="preventPoint" 且 cursor:not-allowed。
+        // 逐页点「下一页」直至触底（图标禁用 或 当前页>=总页），间隔 CONFIG.coursewarePageDelay，setTimeout 递进不阻塞；
+        // 翻完置 coursewareFlipDone=true 并 postMessage(HW_COURSEWARE_DONE) 通知父帧(L2 目录帧)放行推进。
         function runCoursewareFlip() {
-            if (coursewareFlipping || coursewareFlipDone) return; // 防重入：同一课件只翻一遍
+            if (coursewareFlipping || coursewareFlipDone) return; // 防重入：同一 PPT 只翻一遍
             coursewareFlipping = true;
 
             const startedAt = Date.now();
-            const MAX_PAGES = 200;          // 安全上限：最多翻 200 页
-            const MAX_TOTAL_MS = 5 * 60 * 1000; // 总超时：5 分钟兜底，避免死循环
+            const MAX_PAGES = 300;          // 安全上限：最多翻 300 页
+            const MAX_TOTAL_MS = 10 * 60 * 1000; // 总超时：10 分钟兜底，避免死循环
             let flipped = 0;
+            let stalls = 0;                 // 连续点击后页码未变化的次数（防卡死）
 
-            // 探测「下一页」翻页控件（启发式）：文本含「下一页/下一张/下页」或 class 含 next/right/arrow 的可点元素，
-            // 排除已禁用的（disabled / aria-disabled / class 含 disabled），禁用即视为已到末页。
+            // 读取 edm 页脚页码 .footer-left > span，文本如 "43  /   43"（空格不规则，先压缩空白再按 / 拆）。
+            // 返回 { cur, total } 或 null。
+            function readPageNum() {
+                const footer = document.querySelector('.footer-left');
+                const span = footer && footer.querySelector('span');
+                if (!span) return null;
+                const m = (span.textContent || '').replace(/\s+/g, '').match(/^(\d+)\/(\d+)$/);
+                if (!m) return null;
+                return { cur: parseInt(m[1], 10), total: parseInt(m[2], 10) };
+            }
+
+            // 探测「下一页」图标：edm 结构里它是页码 span 之后的第一个 .footer-icon。
+            // 到末页时该图标 id="preventPoint" 或 cursor:not-allowed，视为禁用（已到末页）。
+            // 兜底：若非 edm 结构，再按文本「下一页」/ class next/right/arrow 启发式找。
             function findNextPageBtn() {
+                const footer = document.querySelector('.footer-left');
+                if (footer) {
+                    const span = footer.querySelector('span');
+                    const icon = span && span.nextElementSibling;
+                    if (icon && icon.classList && icon.classList.contains('footer-icon')) {
+                        let cursor = '';
+                        try { cursor = getComputedStyle(icon).cursor || ''; } catch (e) {}
+                        const disabled = icon.id === 'preventPoint' || /not-allowed/i.test(cursor);
+                        return disabled ? { atEnd: true, el: null } : { atEnd: false, el: icon };
+                    }
+                }
                 const candidates = Array.from(document.querySelectorAll(
                     'button, a, [role="button"], [class*="next" i], [class*="right" i], [class*="arrow" i]'
                 ));
                 const TEXT_KW = ['下一页', '下一张', '下页', '后一页'];
                 for (const el of candidates) {
-                    if (!el.offsetParent) continue; // 不可见跳过
+                    if (!el.offsetParent) continue;
                     const disabled = el.disabled === true
                         || el.getAttribute('disabled') !== null
                         || el.getAttribute('aria-disabled') === 'true'
                         || /disabled/i.test(el.className || '');
                     const text = (el.innerText || el.textContent || '').replace(/\s+/g, '');
                     const cls = (el.className && el.className.toString ? el.className.toString() : '') || '';
-                    const byText = TEXT_KW.some(kw => text.includes(kw));
-                    const byClass = /next|right|arrow/i.test(cls);
-                    if (!byText && !byClass) continue;
-                    // 命中翻页特征：若禁用，返回标记表示已到末页；否则返回可点按钮
+                    if (!TEXT_KW.some(kw => text.includes(kw)) && !/next|right|arrow/i.test(cls)) continue;
                     if (disabled) return { atEnd: true, el: null };
                     return { atEnd: false, el };
                 }
-                return null; // 没找到任何翻页控件
+                return null;
             }
 
-            // 探测页码：匹配「3/10」「3 / 10」之类文本，判断 当前页>=总页 即末页。
-            function isLastPageByNumber() {
-                const text = (document.body.innerText || '');
-                const m = text.match(/(\d+)\s*\/\s*(\d+)/);
-                if (m) {
-                    const cur = parseInt(m[1], 10);
-                    const total = parseInt(m[2], 10);
-                    if (total > 0 && cur >= total) return true;
-                }
-                // pagination 当前页/总页：找 active 当前页与最后一个页码对比
-                const pager = document.querySelector('[class*="pagination" i], [class*="pager" i]');
-                if (pager) {
-                    const active = pager.querySelector('.active, .is-active, [class*="active" i], [class*="current" i]');
-                    const pages = Array.from(pager.querySelectorAll('li, a, span, button'))
-                        .map(n => parseInt((n.innerText || '').trim(), 10))
-                        .filter(n => !isNaN(n));
-                    if (active && pages.length) {
-                        const curNum = parseInt((active.innerText || '').trim(), 10);
-                        const maxNum = Math.max.apply(null, pages);
-                        if (!isNaN(curNum) && curNum >= maxNum) return true;
-                    }
-                }
-                return false;
+            // edm 翻页图标是 better-scroll 组件，只认完整指针/鼠标事件序列，裸 .click() 翻不动（实测无反应）。
+            // 派发 pointerdown→mousedown→pointerup→mouseup→click（带坐标，PointerEvent 不可用时退回 MouseEvent）。
+            function realClick(el) {
+                const d = el.ownerDocument, w = d.defaultView, r = el.getBoundingClientRect();
+                const o = {
+                    bubbles: true, cancelable: true, view: w,
+                    clientX: r.left + r.width / 2, clientY: r.top + r.height / 2,
+                    button: 0, pointerId: 1, pointerType: 'mouse'
+                };
+                ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach(t => {
+                    const Ctor = (t[0] === 'p' && w.PointerEvent) ? w.PointerEvent : w.MouseEvent;
+                    try { el.dispatchEvent(new Ctor(t, o)); } catch (e) {}
+                });
             }
 
             function finish(reason) {
                 coursewareFlipping = false;
-                coursewareFlipDone = true; // 放行：下一轮 scanner 把该课件当 ended 推进
-                console.log(`[助手 v2.1] 课件翻页完成（${reason}），共翻 ${flipped} 页，交还连播推进。`);
+                coursewareFlipDone = true;
+                console.log(`[助手 v2.1] 课件翻页完成（${reason}），共翻 ${flipped} 页。`);
+                // 通知父帧(L2 目录帧)：该 PPT 已翻到末页，可放行逃逸推进到下一节
+                try { window.parent.postMessage({ type: 'HW_COURSEWARE_DONE' }, '*'); } catch (e) {}
             }
 
             function step() {
-                // 超时 / 超页数兜底
-                if (flipped >= MAX_PAGES || (Date.now() - startedAt) > MAX_TOTAL_MS) {
-                    finish('达到安全上限'); return;
-                }
-                // 末页判据一：页码显示当前页>=总页
-                if (isLastPageByNumber()) { finish('页码触底'); return; }
+                if (flipped >= MAX_PAGES || (Date.now() - startedAt) > MAX_TOTAL_MS) { finish('达到安全上限'); return; }
+
+                const before = readPageNum();
+                // 末页判据一：页码当前页>=总页
+                if (before && before.total > 0 && before.cur >= before.total) { finish('页码触底'); return; }
 
                 const next = findNextPageBtn();
-                // 末页判据二：找不到翻页控件 或 翻页按钮已禁用
+                // 末页判据二：找不到翻页控件 或 翻页图标已禁用
                 if (!next || next.atEnd) { finish('已无可点的下一页'); return; }
 
-                try { next.el.click(); } catch (e) { /* 忽略单页点击异常，继续下一轮 */ }
+                realClick(next.el); // 完整指针事件序列翻页（裸 .click() 对 better-scroll 无效）
                 flipped++;
-                setTimeout(step, CONFIG.coursewarePageDelay); // 按配置间隔翻下一页，给平台记录浏览时长
+
+                // 异步重渲染：延迟后校验页码是否前进，连续 3 次没动就判末页停手（防图标点不动时死循环）
+                setTimeout(() => {
+                    const after = readPageNum();
+                    if (before && after && after.cur === before.cur) {
+                        if (++stalls >= 3) { finish('页码连续未前进'); return; }
+                    } else {
+                        stalls = 0;
+                    }
+                    step();
+                }, CONFIG.coursewarePageDelay); // 按配置间隔翻下一页，给平台记录每页浏览时长
             }
 
-            // 首轮延迟一拍再开始，等课件 PPT 容器渲染完成
+            // 首轮延迟一拍再开始，等 PPT 渲染完成
             setTimeout(step, CONFIG.coursewarePageDelay);
         }
 
