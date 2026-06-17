@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         华为人才在线课程助手 (Huawei Talent Helper) - v1.3.12
+// @name         华为人才在线课程助手 (Huawei Talent Helper) - v1.3.13
 // @namespace    http://tampermonkey.net/
-// @version      1.3.12
+// @version      1.3.13
 // @description  【AI做题增强】支持自动连播、倍速、防挂机，并可调用 DeepSeek/Gemini/Qwen 官方 API 自动进入测验、逐题作答、检查未答、交卷并进入下一环节。
 // @author       Antigravity
 // @match        *://e.huawei.com/cn/talent/*
@@ -736,14 +736,31 @@
         const questions = collectQuestionGroups();
         if (questions.length > 0) {
             const sig = buildQuestionSignature(questions);
+            const dbgTitle = (questions[0] && questions[0].text || '').slice(0, 24);
+            // 守卫①：本题刚刚点过「下一题」推进，但 DOM 还没换到下一题（过渡空窗，sig 没变）→ 本轮什么都不做，
+            // 等下一题真正渲染出来(sig 变化)再处理。杜绝转场期对同一道题反复触发动作。
+            if (sig === lastAdvancedSignature) {
+                console.log(`[华为助手 AI][cycle] 已推进过、等待换题: ${dbgTitle}`);
+                return;
+            }
             // 本题尚未确认作答成功 → 先作答（回填+校验），本轮不推进。
             if (sig !== lastSolvedSignature) {
+                console.log(`[华为助手 AI][cycle] 作答: ${dbgTitle} (lastSolved=${lastSolvedSignature.slice(0,16)})`);
                 await solveQuestionsWithAi('auto');
             }
-            // 仅当本题确已作答成功(lastSolvedSignature 命中)、且从未推进过 → 推进一次。
-            // 「确认作答后才推进 + 每题仅推一次」是防跳题的核心：彻底杜绝还没作答就点下一题、或同一题被推进两次。
-            if (AI_CONFIG.autoSubmit && lastSolvedSignature === sig && lastAdvancedSignature !== sig) {
+            // 仅当本题确已作答成功(lastSolvedSignature 命中) → 推进一次。
+            // 「确认作答后才推进」是防跳题的核心：杜绝还没作答就点下一题。
+            if (AI_CONFIG.autoSubmit && lastSolvedSignature === sig) {
+                // 守卫②（关键）：作答期间(AI 网络延迟/Vue 重渲染)屏上题目可能已经变了。
+                // 推进前重新读一次当前屏题，若已不是刚作答的这道题，绝不点「下一题」——
+                // 否则会对刚渲染出来、还没作答的下一题点掉，造成「隔一题被自动跳过」。
+                const liveSig = buildQuestionSignature(collectQuestionGroups());
+                if (liveSig !== sig) {
+                    console.log(`[华为助手 AI][cycle] 推进前发现已换题，放弃本次推进(防跳题): ${dbgTitle}`);
+                    return;
+                }
                 lastAdvancedSignature = sig;
+                console.log(`[华为助手 AI][cycle] 推进(下一题/交卷): ${dbgTitle}`);
                 trySubmitAnswer();
             }
             return;
@@ -962,7 +979,7 @@
 
             panelElement.innerHTML = `
                 <div id="hw-drag-head" style="font-weight: bold; color: #ee0000; border-bottom: 1px solid #ebeef5; margin-bottom: 8px; padding-bottom: 6px; cursor: move; display: flex; justify-content: space-between; align-items: center;">
-                    <span id="hw-panel-title">华为助手 v1.3.12</span>
+                    <span id="hw-panel-title">华为助手 v1.3.13</span>
                     <span id="btn-fold" style="cursor: pointer; font-family: monospace; font-size: 14px; font-weight: bold; color: #909399; padding: 0 6px; background: #f4f4f5; border-radius: 3px;">[-]</span>
                 </div>
                 <div id="hw-panel-body">
@@ -1052,7 +1069,7 @@
                     mini.style.display = 'none';
                     this.innerText = '[-]';
                     panelElement.style.width = '320px';
-                    panelElement.querySelector('#hw-panel-title').innerText = '华为助手 v1.3.12';
+                    panelElement.querySelector('#hw-panel-title').innerText = '华为助手 v1.3.13';
                 }
                 updatePanelUI();
             });
